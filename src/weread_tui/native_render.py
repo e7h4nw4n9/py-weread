@@ -8,6 +8,8 @@ from PIL import Image
 from weasyprint import CSS, HTML  # type: ignore[import-untyped]
 from weasyprint.urls import URLFetcher, URLFetcherResponse  # type: ignore[import-untyped]
 
+from weread_tui.layout_positions import page_spans
+
 BASE_URL = "https://weread.invalid/"
 
 
@@ -35,26 +37,38 @@ class CachedResources(URLFetcher):  # type: ignore[misc]  # WeasyPrint 尚未标
         return URLFetcherResponse(url, body=data, headers={"Content-Type": mime})
 
 
-def paginate(job: dict[str, Any]) -> int:
+def paginate(job: dict[str, Any]) -> tuple[int, list[dict[str, str | int]]]:
     """按 job 中的源文档、缓存资源和像素视口生成分页 PDF。"""
     width, height = int(job["width"]), int(job["height"])
     if width < 160 or height < 160:
         raise ValueError("阅读区域太小，请扩大终端窗口后重试。")
     fetcher = CachedResources(job["images"])
+    font_size = job.get("font_size", 20)
+    line_height = job.get("line_height", 1.6)
     css = f"""
     @page {{ size: {width}px {height}px !important; margin: 24px 32px !important;
              background: #f5ead7; }}
-    body {{ font-family: 'Songti SC', serif !important; font-size: 20px !important;
-            line-height: 1.6 !important; color: #302a24; }}
+    body {{ font-family: 'Songti SC', serif !important; font-size: {font_size}px !important;
+            line-height: {line_height} !important; color: #302a24; }}
     img {{ max-width: 100%; max-height: {height - 48}px; height: auto; }}
     pre {{ white-space: pre-wrap; overflow-wrap: anywhere; }}
     """
+    if job.get("runs") is not None:
+        css += """
+        weread-text { display: inline !important; }
+        *, *::before, *::after, *::first-letter {
+            hyphens: none !important; text-transform: none !important;
+        }
+        """
+        css += f"weread-text {{ font-size: {font_size}px !important; line-height: {line_height} !important; }}"
     document = HTML(string=job["source"], base_url=BASE_URL, url_fetcher=fetcher).render(
         stylesheets=[CSS(string=job["stylesheet"], base_url=BASE_URL, url_fetcher=fetcher), CSS(string=css)],
         presentational_hints=True,
     )
     path = Path(job["directory"]) / "chapter.pdf"
     temporary = path.with_suffix(".tmp")
+    # 从最终布局读取区间，首字下沉也按实际字符参与映射。
+    spans = page_spans(document, job["runs"]) if job.get("runs") is not None else []
     document.write_pdf(temporary)
     temporary.replace(path)
-    return len(document.pages)
+    return len(document.pages), spans

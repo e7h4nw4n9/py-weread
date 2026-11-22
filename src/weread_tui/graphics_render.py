@@ -8,6 +8,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
+from weread_tui.positions import PageMap, PageSpan, PreparedDocument
+
 
 class RenderError(Exception):
     """图形排版未完成，可向用户显示的原因。"""
@@ -22,6 +24,7 @@ class RenderSession:
         self._temporary = TemporaryDirectory(prefix="pages-", dir=cache_root)
         self.directory = Path(self._temporary.name)
         self.page_count = 0
+        self.page_map: PageMap | None = None
         self._lock = asyncio.Lock()
         self._process: asyncio.subprocess.Process | None = None
 
@@ -60,13 +63,20 @@ class RenderSession:
                 await self._stop_process(process)
                 self._process = None
 
-    async def paginate(self, source: str, *, stylesheet: str, images: dict[str, Path], width: int, height: int) -> int:
-        """按 source、stylesheet、images 和 width/height 像素视口分页。"""
-        result = await self._run({
-            "action": "paginate", "source": source, "stylesheet": stylesheet,
+    async def paginate(self, source: str | PreparedDocument, *, stylesheet: str, images: dict[str, Path],
+                       width: int, height: int, font_size: int = 20, line_height: float = 1.6) -> int:
+        """按 source、样式、images、像素视口与 font_size/line_height 分页并保留位置映射。"""
+        prepared = source if isinstance(source, PreparedDocument) else None
+        job = {
+            "action": "paginate", "source": prepared.html if prepared is not None else source, "stylesheet": stylesheet,
             "images": {reference: str(path) for reference, path in images.items()}, "width": width, "height": height,
-        })
+            "font_size": font_size, "line_height": line_height,
+        }
+        if prepared is not None:
+            job["runs"] = {run_id: run.text for run_id, run in prepared.runs.items()}
+        result = await self._run(job)
         self.page_count = int(result["page_count"])
+        self.page_map = PageMap(prepared.revision, [PageSpan(**span) for span in result["spans"]]) if prepared is not None else None
         return self.page_count
 
     async def page(self, index: int) -> Path:

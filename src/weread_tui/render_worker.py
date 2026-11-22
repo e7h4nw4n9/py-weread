@@ -36,10 +36,11 @@ def main() -> None:
             if job["action"] == "paginate":
                 from weread_tui.native_render import paginate
 
-                count = paginate(job)
+                count, spans = paginate(job)
                 for index in range(min(2, count)):
                     rasterize(Path(job["directory"]), index)
                 result["page_count"] = count
+                result["spans"] = spans
             else:
                 rasterize(Path(job["directory"]), int(job["index"]))
         print(json.dumps(result), flush=True)

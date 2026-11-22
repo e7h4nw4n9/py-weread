@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from textual import events
+from textual._xterm_parser import XTermParser
 
 from weread_tui.account import AccountService
 from weread_tui.app import WereadApp
@@ -84,3 +86,82 @@ async def test_graphics_view_closes_during_native_render(tmp_path: Path, monkeyp
         await pilot.pause()
         assert children[0].returncode is not None
         assert not screen.session.directory.exists()
+
+
+async def test_font_and_spacing_keep_current_character(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """tmp_path 隔离资源；monkeypatch 在成功重排后模拟外部渲染失败。"""
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json={}))
+    account = AccountService(CredentialStore(), transport=transport)
+    provider = WereadProvider(Credentials(vid="reader", skey="session"), transport, tmp_path)
+    document = ChapterDocument(Book("reader", "1", "书"), Chapter("2", "长段"),
+                               "重复句 English 中文 😀 e\u0301。" * 300, "txt")
+    app = WereadApp(account=account)
+    async with app.run_test(size=(80, 30)) as pilot:
+        screen = GraphicsScreen(provider, document, TerminalCapabilities(8, 16, True))
+        await app.push_screen(screen)
+        await pilot.pause()
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=15)
+        await pilot.press("l", "l")
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=15)
+        assert screen.current_page == 2
+        assert screen.session.page_map is not None
+        anchor = screen.session.page_map.first_anchor(screen.current_page)
+        assert anchor is not None
+        # 单独等待缩小完成，避免后续放大取消了缩小任务而漏测。
+        await pilot.press("minus")
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=15)
+        assert screen.rendered_settings == (18, 1.6)
+        assert screen.session.page_map is not None
+        assert screen.session.page_map.locate(anchor) == screen.current_page
+        await pilot.press("plus")
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=15)
+        assert screen.rendered_settings == (20, 1.6)
+        assert screen.session.page_map is not None
+        assert screen.session.page_map.locate(anchor) == screen.current_page
+        old_directory = screen.session.directory
+        # 输入真实终端字符及 CSI 序列，避免测试只覆盖理想化的按键名。
+        parser = XTermParser(False)
+        keys = [event.key for sequence in ("+", "\x1b[43;2u", "-", "=")
+                for event in parser.feed(sequence) if isinstance(event, events.Key)]
+        await pilot.press(*keys)
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=15)
+        assert screen.font_size == 24
+        assert screen.rendered_settings == (24, 1.6)
+        assert screen.session.page_map is not None
+        assert screen.session.page_map.locate(anchor) == screen.current_page
+        assert not old_directory.exists()
+        await pilot.press("ctrl+up")
+        assert screen.line_height == 1.6
+        keys = [event.key for event in parser.feed("\x1b[1;2A") if isinstance(event, events.Key)]
+        await pilot.press(*keys)
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=15)
+        assert screen.line_height == 1.8
+        assert screen.session.page_map is not None
+        assert screen.session.page_map.locate(anchor) == screen.current_page
+        keys = [event.key for event in parser.feed("\x1b[1;2B") if isinstance(event, events.Key)]
+        await pilot.press(*keys)
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=15)
+        assert screen.rendered_settings == (24, 1.6)
+        assert screen.session.page_map is not None
+        assert screen.session.page_map.locate(anchor) == screen.current_page
+        await pilot.press("shift+equals_sign")
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=15)
+        assert screen.rendered_settings == (26, 1.6)
+        previous = screen.session
+        previous_page = screen.current_page
+        spawn = asyncio.create_subprocess_exec
+
+        async def failed_render(*command: str, **options: Any) -> asyncio.subprocess.Process:
+            """command 是外部渲染调用；options 保留进程管道与回收行为。"""
+            return await spawn(sys.executable, "-c",
+                               'import sys; sys.stdin.read(); print(\'{"error":"测试排版失败"}\')', **options)
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", failed_render)
+        await pilot.press("plus")
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=15)
+        assert screen.session is previous
+        assert screen.current_page == previous_page
+        assert screen.font_size == 26
+        assert screen.picture.image is not None
+        assert screen.pending is None
+        await pilot.press("escape")
