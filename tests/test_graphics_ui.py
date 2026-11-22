@@ -52,10 +52,14 @@ async def test_graphics_pages_can_turn_and_close(tmp_path: Path) -> None:
         assert not directory.exists()
 
 
-async def test_graphics_view_closes_during_native_render(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """tmp_path 隔离会话，monkeypatch 仅让外部原生进程稳定保持运行。"""
+@pytest.mark.parametrize("delayed_handle", [False, True])
+async def test_graphics_view_closes_during_native_render(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, delayed_handle: bool,
+) -> None:
+    """tmp_path 隔离会话；monkeypatch 模拟长进程，delayed_handle 延迟系统句柄交付。"""
     spawn = asyncio.create_subprocess_exec
     started = asyncio.Event()
+    release = asyncio.Event()
     children: list[asyncio.subprocess.Process] = []
 
     async def slow_process(*command: str, **options: Any) -> asyncio.subprocess.Process:
@@ -63,6 +67,8 @@ async def test_graphics_view_closes_during_native_render(tmp_path: Path, monkeyp
         process = await spawn(sys.executable, "-c", "import sys,time; sys.stdin.read(); time.sleep(60)", **options)
         children.append(process)
         started.set()
+        if delayed_handle:
+            await release.wait()
         return process
 
     def respond(request: httpx.Request) -> httpx.Response:
@@ -82,7 +88,17 @@ async def test_graphics_view_closes_during_native_render(tmp_path: Path, monkeyp
         screen = GraphicsScreen(provider, document, TerminalCapabilities(8, 16, True))
         await app.push_screen(screen)
         await asyncio.wait_for(started.wait(), timeout=5)
-        await pilot.press("escape")
+        try:
+            app.simulate_key("escape")
+            if delayed_handle:
+                async def wait_for_close() -> None:
+                    """等界面进入关闭流程后再交付进程句柄。"""
+                    while not screen.closing:
+                        await asyncio.sleep(0.01)
+
+                await asyncio.wait_for(wait_for_close(), 3)
+        finally:
+            release.set()
         await pilot.pause()
         assert children[0].returncode is not None
         assert not screen.session.directory.exists()

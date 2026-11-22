@@ -1,5 +1,6 @@
 """阅读器基础界面。"""
 
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
@@ -9,6 +10,7 @@ from weread_tui.account import AccountService
 from weread_tui.credentials import Credentials, CredentialStore
 from weread_tui.login import ApiKeyScreen, LoginScreen
 from weread_tui.library import LibraryScreen
+from weread_tui.terminal import refresh_terminal_capabilities
 
 
 class WereadApp(App[None]):
@@ -48,6 +50,10 @@ class WereadApp(App[None]):
     def on_mount(self) -> None:
         """后台恢复凭据，避免 Keychain 和网络操作阻塞界面。"""
         self.run_worker(self.restore_account(), group="account")
+
+    def on_resize(self, event: events.Resize) -> None:
+        """用 event 更新全局像素缓存，覆盖尚未打开阅读界面的尺寸变化。"""
+        refresh_terminal_capabilities(event.size, event.pixel_size)
 
     async def restore_account(self) -> None:
         """恢复完成后启用账号操作。"""

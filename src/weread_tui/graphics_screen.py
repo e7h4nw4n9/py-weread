@@ -1,10 +1,15 @@
 """以整页图像显示 XHTML/CSS 排版结果。"""
 
+import asyncio
+from functools import partial
+
+from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.screen import Screen
 from textual.widgets import Footer, Header, Static
+from textual.worker import WorkType
 from textual_image.widget import Image
 
 from weread_tui.chapter_protocol import ContentError
@@ -14,7 +19,7 @@ from weread_tui.source_positions import prepare_document
 from weread_tui.resources import ImageResources
 from weread_tui.models import ChapterDocument
 from weread_tui.provider import ProviderError, WereadProvider
-from weread_tui.terminal import TerminalCapabilities
+from weread_tui.terminal import TerminalCapabilities, refresh_terminal_capabilities
 
 
 class GraphicsScreen(Screen[None]):
@@ -53,6 +58,10 @@ class GraphicsScreen(Screen[None]):
         self.target_page = 0
         self.current_page = 0
         self.reading_anchor: ContentAnchor | None = None
+        self.render_version = 0
+        self.rendering = False
+        self.closing = False
+        self.ready = False
 
     def compose(self) -> ComposeResult:
         """生成页图像区域及加载状态。"""
@@ -64,14 +73,43 @@ class GraphicsScreen(Screen[None]):
 
     def on_mount(self) -> None:
         """等待首次布局完成，再测量可用阅读区域。"""
+        self.ready = True
+        self.set_interval(0.5, self.check_terminal_size)
         self.call_after_refresh(self.start_render)
+
+    def on_resize(self, event: events.Resize) -> None:
+        """收到 event 后清理旧图，等待新布局完成再排版。"""
+        if self.ready and not self.closing:
+            capabilities = refresh_terminal_capabilities(event.size, event.pixel_size)
+            if capabilities is not None:
+                self.capabilities = capabilities
+            self.picture.image = None
+            self.start_render()
+
+    def check_terminal_size(self) -> None:
+        """检测跨屏等未改变字符网格的像素变化，只在单元格尺寸变化时重排。"""
+        if self.closing:
+            return
+        capabilities = refresh_terminal_capabilities()
+        if capabilities is not None and capabilities != self.capabilities:
+            self.capabilities = capabilities
+            self.picture.image = None
+            self.start_render()
 
     def start_render(self) -> None:
         """在后台生成当前章节的 PDF 和首张图片。"""
-        self.run_worker(self.render_chapter(), group="graphics", exclusive=True)
+        if self.closing:
+            return
+        self.render_version += 1
+        self.rendering = True
+        work: WorkType[None] = partial(self.render_chapter, self.reading_anchor, self.render_version)
+        self.run_worker(work, group="graphics", exclusive=True)
 
-    async def render_chapter(self, anchor: ContentAnchor | None = None) -> None:
-        """按当前字号和行高重排；anchor 指向重排前正在显示的字符。"""
+    async def render_chapter(self, anchor: ContentAnchor | None, version: int) -> None:
+        """按 anchor 重排；version 隔离过期结果，短暂等待合并连续输入。"""
+        await asyncio.sleep(0.12)
+        if version != self.render_version or self.closing:
+            return
         area = self.query_one("#graphics-page").content_size
         font_size, line_height = self.font_size, self.line_height
         pending = RenderSession(self.provider.cache_root.parent / "render")
@@ -96,6 +134,8 @@ class GraphicsScreen(Screen[None]):
             assert pending.page_map is not None
             index = pending.page_map.locate(anchor) if anchor is not None else 0
             path = await pending.page(index)
+            if version != self.render_version or self.closing:
+                return
             previous = self.session
             self.session = pending
             self.picture.image = path
@@ -106,6 +146,8 @@ class GraphicsScreen(Screen[None]):
             self.update_status()
             await previous.close()
         except (ContentError, ProviderError, RenderError, PositionError) as error:
+            if version != self.render_version or self.closing:
+                return
             self.font_size, self.line_height = self.rendered_settings
             self.query_one("#graphics-status", Static).update(f"图形排版未完成：{error}")
         finally:
@@ -113,6 +155,8 @@ class GraphicsScreen(Screen[None]):
                 await pending.close()
             if self.pending is pending:
                 self.pending = None
+            if version == self.render_version:
+                self.rendering = False
 
     def update_status(self) -> None:
         """显示实际书页及本次排版参数。"""
@@ -134,7 +178,7 @@ class GraphicsScreen(Screen[None]):
         self.query_one("#graphics-status", Static).update(
             f"正在重排 · 目标字号 {self.font_size} · 行距 {self.line_height:.1f}"
         )
-        self.run_worker(self.render_chapter(anchor), group="graphics", exclusive=True)
+        self.start_render()
 
     def action_font(self, offset: int) -> None:
         """按 offset 调整字号，范围为 16 至 28 像素。"""
@@ -160,25 +204,33 @@ class GraphicsScreen(Screen[None]):
         self.line_height = target
         self.reflow()
 
-    async def show_page(self, index: int) -> None:
-        """显示 index 页，并在后台准备相邻页。"""
+    async def show_page(self, index: int, version: int) -> None:
+        """显示 index 页；version 过期后不更新界面或报错。"""
+        session = self.session
         try:
-            path = await self.session.page(index)
+            path = await session.page(index)
+            if version != self.render_version or self.closing:
+                return
             self.picture.image = path
             self.current_page = index
-            assert self.session.page_map is not None
-            self.reading_anchor = self.session.page_map.first_anchor(index)
+            assert session.page_map is not None
+            self.reading_anchor = session.page_map.first_anchor(index)
             self.update_status()
             for neighbour in (index - 1, index + 1):
-                if 0 <= neighbour < self.session.page_count:
-                    await self.session.page(neighbour)
-            self.session.keep_near(index)
+                if 0 <= neighbour < session.page_count:
+                    await session.page(neighbour)
+                    if version != self.render_version or self.closing:
+                        return
+            session.keep_near(index)
         except RenderError as error:
+            if version != self.render_version or self.closing:
+                return
+            self.target_page = self.current_page
             self.query_one("#graphics-status", Static).update(f"书页生成失败：{error}")
 
     def move_page(self, offset: int) -> None:
         """按 offset 调整目标页，快速按键只保留最新目标。"""
-        if self.pending is not None:
+        if self.rendering:
             self.notify("正在重排，请稍候。")
             return
         target = self.target_page + offset
@@ -187,7 +239,9 @@ class GraphicsScreen(Screen[None]):
             return
         if 0 <= target < self.session.page_count:
             self.target_page = target
-            self.run_worker(self.show_page(target), group="graphics", exclusive=True)
+            self.render_version += 1
+            work: WorkType[None] = partial(self.show_page, target, self.render_version)
+            self.run_worker(work, group="graphics", exclusive=True)
 
     def action_next_page(self) -> None:
         """显示下一页。"""
@@ -203,6 +257,9 @@ class GraphicsScreen(Screen[None]):
 
     async def on_unmount(self) -> None:
         """清理终端图像、原生子进程及当前会话的临时文件。"""
+        self.closing = True
+        self.render_version += 1
+        self.workers.cancel_group(self, "graphics")
         self.picture.image = None
         if self.pending is not None:
             await self.pending.close()

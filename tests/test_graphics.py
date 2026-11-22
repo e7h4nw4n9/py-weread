@@ -54,6 +54,44 @@ async def test_cancelling_render_reaps_native_process(tmp_path: Path, monkeypatc
         await session.close()
 
 
+@pytest.mark.parametrize("cancel_count", [1, 2])
+async def test_cancelling_during_process_creation_reaps_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel_count: int,
+) -> None:
+    """tmp_path 隔离会话；monkeypatch 延迟句柄，cancel_count 模拟连续任务取消。"""
+    spawn = asyncio.create_subprocess_exec
+    started = asyncio.Event()
+    release = asyncio.Event()
+    children: list[asyncio.subprocess.Process] = []
+
+    async def delayed_spawn(*command: str, **options: Any) -> asyncio.subprocess.Process:
+        """command/options 来自真实渲染调用，只延迟系统进程句柄的返回。"""
+        process = await spawn(sys.executable, "-c", "import time; time.sleep(60)", **options)
+        children.append(process)
+        started.set()
+        await release.wait()
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
+    session = RenderSession(tmp_path)
+    task = asyncio.create_task(session.paginate("<p>文本</p>", stylesheet="", images={}, width=480, height=640))
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        for _ in range(cancel_count):
+            task.cancel()
+            await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert children[0].returncode is not None
+    finally:
+        for child in children:
+            if child.returncode is None:
+                child.kill()
+            await child.wait()
+        await session.close()
+
+
 @pytest.mark.parametrize("approved", [True, False])
 async def test_renderer_only_reads_explicit_image_mapping(tmp_path: Path, approved: bool) -> None:
     """tmp_path 保存红色样本图；approved 决定是否显式提供给排版器。"""

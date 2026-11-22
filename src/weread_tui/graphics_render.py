@@ -27,6 +27,7 @@ class RenderSession:
         self.page_map: PageMap | None = None
         self._lock = asyncio.Lock()
         self._process: asyncio.subprocess.Process | None = None
+        self._creation: asyncio.Task[asyncio.subprocess.Process] | None = None
 
     async def _stop_process(self, process: asyncio.subprocess.Process) -> None:
         """终止并回收 process，取消不让原生渲染继续消耗资源。"""
@@ -45,17 +46,38 @@ class RenderSession:
                 libraries = [path for path in ("/opt/homebrew/lib", "/usr/local/lib") if Path(path).is_dir()]
                 existing = environment.get("DYLD_FALLBACK_LIBRARY_PATH", "")
                 environment["DYLD_FALLBACK_LIBRARY_PATH"] = os.pathsep.join(filter(None, [existing, *libraries]))
-            process = await asyncio.create_subprocess_exec(
+            creation = asyncio.create_task(asyncio.create_subprocess_exec(
                 sys.executable, "-m", "weread_tui.render_worker",
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 env=environment,
-            )
+            ))
+            self._creation = creation
+            try:
+                try:
+                    process = await asyncio.shield(creation)
+                except asyncio.CancelledError:
+                    # 创建已交给系统时，先取得句柄才能可靠回收子进程。
+                    while True:
+                        try:
+                            process = await asyncio.shield(creation)
+                            break
+                        except asyncio.CancelledError:
+                            if creation.cancelled():
+                                raise
+                            # 连续重排会重复取消旧任务，不能取消句柄交付。
+                    await self._stop_process(process)
+                    raise
+            finally:
+                self._creation = None
             self._process = process
             try:
                 output, _ = await process.communicate(json.dumps({"directory": str(self.directory), **job}).encode())
                 if not output:
                     raise RenderError("图形渲染进程异常退出，请重新打开章节。")
-                result: dict[str, Any] = json.loads(output)
+                try:
+                    result: dict[str, Any] = json.loads(output)
+                except json.JSONDecodeError as error:
+                    raise RenderError("图形渲染进程返回了不完整结果，请重试。") from error
                 if process.returncode or "error" in result:
                     raise RenderError(result.get("error", "图形渲染未完成。"))
                 return result
@@ -97,6 +119,9 @@ class RenderSession:
 
     async def close(self) -> None:
         """停止当前任务并清理该会话的 PDF 与图片。"""
+        if self._creation is not None:
+            process = await asyncio.shield(self._creation)
+            await self._stop_process(process)
         if self._process is not None:
             await self._stop_process(self._process)
         self._temporary.cleanup()
