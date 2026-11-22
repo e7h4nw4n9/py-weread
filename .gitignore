@@ -1,0 +1,11 @@
+.venv/
+.cache/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.scratch
+dist/
+docs
+AGENTS.md
+GLOSSARY.md
+*.egg-info/

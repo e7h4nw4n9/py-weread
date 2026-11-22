@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "weread-tui"
+version = "0.1.0"
+description = "macOS 微信读书终端阅读器"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "textual>=6,<7",
+    "typer>=0.19,<1",
+    "httpx>=0.28,<1",
+    "keyring>=25,<26",
+    "qrcode>=8,<9",
+    "textual-image[textual]==0.13.2",
+    "pillow>=11,<13",
+    "weasyprint==70.0",
+    "pypdfium2>=5.15,<6",
+]
+
+[project.scripts]
+weread = "weread_tui.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "mypy>=1.18,<2"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/weread_tui"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.mypy]
+files = ["src", "tests"]
+strict = true
