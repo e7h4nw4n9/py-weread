@@ -9,6 +9,7 @@ from textual.widgets import Footer, Header, Label, ListItem, ListView, Static
 from weread_tui.account import AccountService
 from weread_tui.provider import AuthenticationExpired, Book, Chapter, ProviderError, WereadProvider
 from weread_tui.reader import ReaderScreen
+from weread_tui.progress import ProgressStore
 
 
 class NavigationList(ListView):
@@ -33,10 +34,11 @@ class LibraryScreen(Screen[None]):
     LibraryScreen Label { padding: 0 1; }
     """
 
-    def __init__(self, account: AccountService) -> None:
-        """account 提供当前账号快照与 HTTP 边界。"""
+    def __init__(self, account: AccountService, progress: ProgressStore | None = None) -> None:
+        """account 提供账号边界，progress 提供按账号隔离的阅读位置。"""
         super().__init__()
         self.account = account
+        self.progress = progress
         self.provider = WereadProvider(account.credentials, account.transport)
         self.books: list[Book] = []
         self.chapters: list[Chapter] = []
@@ -84,7 +86,7 @@ class LibraryScreen(Screen[None]):
             self.run_worker(self.load_chapters(self.books[event.index]), group="catalogue", exclusive=True)
         elif event.list_view.id == "chapters" and self.selected_book is not None:
             self.app.push_screen(ReaderScreen(self.provider, self.account, self.selected_book,
-                                             self.chapters[event.index], self.chapters))
+                                             self.chapters[event.index], self.chapters, progress=self.progress))
 
     async def load_chapters(self, book: Book) -> None:
         """获取 book 的目录，后一次选书取消前一次请求。"""
@@ -100,6 +102,15 @@ class LibraryScreen(Screen[None]):
                 indent = "  " * max(0, chapter.level - 1)
                 await catalogue.append(ListItem(Label(f"{indent}{chapter.title}", markup=False)))
             self.show_status(f"《{book.title}》共 {len(self.chapters)} 章；Tab 切换目录，Enter 阅读章节。")
+            if self.progress is not None:
+                saved = self.progress.load(book.account_id, book.book_id)
+                if saved is not None:
+                    saved_chapter = next((chapter for chapter in self.chapters if chapter.uid == saved.chapter_uid), None)
+                    if saved_chapter is None:
+                        self.show_status("保存的章节已不在目录中，无法恢复本地位置；旧记录已保留。")
+                    else:
+                        self.app.push_screen(ReaderScreen(self.provider, self.account, book, saved_chapter, self.chapters,
+                                                         progress=self.progress, resume=True))
         except ProviderError as error:
             self.show_error(error)
 

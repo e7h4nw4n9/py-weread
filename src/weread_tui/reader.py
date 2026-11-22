@@ -1,5 +1,7 @@
 """诊断阅读视图；原始正文保留在文档中，显示转换不回写原文。"""
 
+import sqlite3
+
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
@@ -14,6 +16,9 @@ from weread_tui.web_reader import WebSessionExpired
 from weread_tui.document import ImageReference, parse_content
 from weread_tui.graphics_screen import GraphicsScreen
 from weread_tui.terminal import terminal_capabilities
+from weread_tui.progress import ProgressStore
+from weread_tui.source_positions import prepare_document
+from weread_tui.positions import PositionError
 
 
 class ReaderScreen(Screen[None]):
@@ -38,8 +43,9 @@ class ReaderScreen(Screen[None]):
     """
 
     def __init__(self, provider: WereadProvider, account: AccountService, book: Book,
-                 chapter: Chapter, chapters: list[Chapter] | None = None) -> None:
-        """provider/account 为当前账号，book/chapter 指定章节，chapters 提供导航顺序。"""
+                 chapter: Chapter, chapters: list[Chapter] | None = None,
+                 progress: ProgressStore | None = None, resume: bool = False) -> None:
+        """provider/account 提供账号，book/chapter/chapters 指定内容，progress/resume 控制本地恢复。"""
         super().__init__()
         self.provider = provider
         self.account = account
@@ -49,6 +55,9 @@ class ReaderScreen(Screen[None]):
         self.chapter_index = self.chapters.index(chapter)
         self.document: ChapterDocument | None = None
         self.images: list[AutoImage | SixelImage] = []
+        self.progress = progress
+        self.remember_chapter = not resume
+        self.resume_graphics = resume
 
     def compose(self) -> ComposeResult:
         """生成章节正文区和操作提示。"""
@@ -84,6 +93,14 @@ class ReaderScreen(Screen[None]):
                     await content.mount(Vertical(Static(f"{block.alt}：正在加载图片…", markup=False),
                                                  id=f"image-{index}", classes="image-slot"))
             self.document = document
+            if self.remember_chapter:
+                if self.progress is not None:
+                    try:
+                        prepared = prepare_document(document.source, document.format)
+                        self.progress.save(document, prepared.anchor_from_source(0))
+                    except (PositionError, sqlite3.Error) as error:
+                        self.notify(f"本地章节位置保存失败：{error}", severity="error")
+                self.remember_chapter = False
             self.query_one("#reading-scroll", VerticalScroll).scroll_home(animate=False)
             resources = await self.provider.get_images(document)
             for index, block in enumerate(blocks):
@@ -101,6 +118,9 @@ class ReaderScreen(Screen[None]):
             if resources.missing:
                 title += f" · {len(resources.missing)} 张图片未加载。{resources.warning}"
             self.query_one("#reading-status", Static).update(title)
+            if self.resume_graphics:
+                self.resume_graphics = False
+                self.action_graphics()
         except (ContentError, ProviderError) as error:
             if isinstance(error, WebSessionExpired):
                 self.account.web_status = "已失效"
@@ -126,6 +146,7 @@ class ReaderScreen(Screen[None]):
             return
         self.chapter_index = index
         self.chapter = self.chapters[index]
+        self.remember_chapter = True
         self.query_one("#reading-status", Static).update(f"《{self.book.title}》 · {self.chapter.title}")
         self.action_reload()
 
@@ -146,7 +167,7 @@ class ReaderScreen(Screen[None]):
         if not capabilities.graphics:
             self.notify("当前终端未探测到书页图像协议，继续使用文字阅读。")
             return
-        self.app.push_screen(GraphicsScreen(self.provider, self.document, capabilities))
+        self.app.push_screen(GraphicsScreen(self.provider, self.document, capabilities, progress=self.progress))
 
     def action_line_down(self) -> None:
         """正文向下滚动一行。"""

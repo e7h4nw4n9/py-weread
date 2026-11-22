@@ -2,6 +2,7 @@
 
 import asyncio
 from functools import partial
+import sqlite3
 
 from textual import events
 from textual.app import ComposeResult
@@ -19,6 +20,7 @@ from weread_tui.source_positions import prepare_document
 from weread_tui.resources import ImageResources
 from weread_tui.models import ChapterDocument
 from weread_tui.provider import ProviderError, WereadProvider
+from weread_tui.progress import ProgressStore
 from weread_tui.terminal import TerminalCapabilities, refresh_terminal_capabilities
 
 
@@ -40,8 +42,9 @@ class GraphicsScreen(Screen[None]):
     GraphicsScreen Image { width: auto; height: auto; max-width: 100%; max-height: 100%; }
     """
 
-    def __init__(self, provider: WereadProvider, document: ChapterDocument, capabilities: TerminalCapabilities) -> None:
-        """provider/document 提供已授权正文，capabilities 是终端系统边界。"""
+    def __init__(self, provider: WereadProvider, document: ChapterDocument, capabilities: TerminalCapabilities,
+                 progress: ProgressStore | None = None) -> None:
+        """provider/document 提供正文，capabilities 描述终端，progress 可保存本地位置。"""
         super().__init__()
         self.provider = provider
         self.document = document
@@ -58,6 +61,17 @@ class GraphicsScreen(Screen[None]):
         self.target_page = 0
         self.current_page = 0
         self.reading_anchor: ContentAnchor | None = None
+        self.progress = progress
+        self.saved_progress = progress.load(document.book.account_id, document.book.book_id, document.chapter.uid) if progress else None
+        self.position_notice = ""
+        if self.saved_progress is not None:
+            try:
+                self.prepared.source_offset(self.saved_progress.anchor)
+            except PositionError as error:
+                self.position_notice = f"无法准确恢复本地位置：{error}旧记录已保留。"
+            else:
+                self.reading_anchor = self.saved_progress.anchor
+                self.position_notice = "已恢复本地阅读位置。"
         self.render_version = 0
         self.rendering = False
         self.closing = False
@@ -131,12 +145,21 @@ class GraphicsScreen(Screen[None]):
                 height=area.height * self.capabilities.cell_height,
                 font_size=font_size, line_height=line_height,
             )
+            if version != self.render_version or self.closing:
+                return
             assert pending.page_map is not None
-            index = pending.page_map.locate(anchor) if anchor is not None else 0
+            try:
+                index = pending.page_map.locate(anchor) if anchor is not None else 0
+            except PositionError as error:
+                if self.session.page_count or self.saved_progress is None:
+                    raise
+                self.position_notice = f"无法准确恢复本地位置：{error}旧记录已保留，从章首显示。"
+                index, anchor = 0, None
             path = await pending.page(index)
             if version != self.render_version or self.closing:
                 return
             previous = self.session
+            first_display = not previous.page_count
             self.session = pending
             self.picture.image = path
             self.current_page = self.target_page = index
@@ -144,6 +167,8 @@ class GraphicsScreen(Screen[None]):
             self.reading_anchor = anchor if anchor is not None else pending.page_map.first_anchor(index)
             self.rendered_settings = (font_size, line_height)
             self.update_status()
+            if first_display and self.saved_progress is None:
+                self.save_position()
             await previous.close()
         except (ContentError, ProviderError, RenderError, PositionError) as error:
             if version != self.render_version or self.closing:
@@ -164,7 +189,16 @@ class GraphicsScreen(Screen[None]):
         self.query_one("#graphics-status", Static).update(
             f"{self.document.chapter.title} · 第 {self.current_page + 1}/{self.session.page_count} 页"
             f" · 字号 {font_size} · 行距 {line_height:.1f}"
+            f" {self.position_notice}"
         )
+
+    def save_position(self) -> None:
+        """仅在首次阅读或实际翻页时立即提交，不在恢复和重排时刷新时间。"""
+        if self.progress is not None and self.reading_anchor is not None:
+            try:
+                self.saved_progress = self.progress.save(self.document, self.reading_anchor)
+            except sqlite3.Error as error:
+                self.notify(f"本地阅读位置保存失败：{error}", severity="error")
 
     def reflow(self) -> None:
         """沿用当前阅读锚点连续重排，不复用旧页码或重新选取页首。"""
@@ -211,10 +245,14 @@ class GraphicsScreen(Screen[None]):
             path = await session.page(index)
             if version != self.render_version or self.closing:
                 return
+            changed = index != self.current_page
             self.picture.image = path
             self.current_page = index
             assert session.page_map is not None
             self.reading_anchor = session.page_map.first_anchor(index)
+            if changed:
+                self.position_notice = ""
+                self.save_position()
             self.update_status()
             for neighbour in (index - 1, index + 1):
                 if 0 <= neighbour < session.page_count:

@@ -11,6 +11,7 @@ from weread_tui.credentials import Credentials, CredentialStore
 from weread_tui.login import ApiKeyScreen, LoginScreen
 from weread_tui.library import LibraryScreen
 from weread_tui.terminal import refresh_terminal_capabilities
+from weread_tui.progress import ProgressStore
 
 
 class WereadApp(App[None]):
@@ -30,10 +31,11 @@ class WereadApp(App[None]):
     #account-actions Button { margin: 1; }
     """
 
-    def __init__(self, account: AccountService | None = None) -> None:
-        """account 提供 HTTP 与凭据存储边界，默认使用系统 Keychain。"""
+    def __init__(self, account: AccountService | None = None, progress: ProgressStore | None = None) -> None:
+        """account 提供账号边界；progress 注入本地位置存储，命令入口提供实际数据库。"""
         super().__init__()
         self.account = account if account is not None else AccountService(CredentialStore.system())
+        self.progress = progress
 
     def compose(self) -> ComposeResult:
         """生成首页内容与键位提示。"""
@@ -85,7 +87,7 @@ class WereadApp(App[None]):
         elif event.button.id == "set-api-key":
             self.push_screen(ApiKeyScreen(), self.key_submitted)
         elif event.button.id == "bookshelf":
-            self.push_screen(LibraryScreen(self.account), lambda _: self.update_account())
+            self.push_screen(LibraryScreen(self.account, self.progress), lambda _: self.update_account())
 
     def login_finished(self, credentials: Credentials | None) -> None:
         """扫码完成后在首页保存 credentials；取消扫描不改变当前账号。"""
