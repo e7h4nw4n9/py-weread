@@ -10,6 +10,7 @@ from weread_tui.account import AccountService
 from weread_tui.provider import AuthenticationExpired, Book, Chapter, ProviderError, WereadProvider
 from weread_tui.reader import ReaderScreen
 from weread_tui.progress import ProgressStore
+from weread_tui.reading_resume import select_resume
 
 
 class NavigationList(ListView):
@@ -39,7 +40,7 @@ class LibraryScreen(Screen[None]):
         super().__init__()
         self.account = account
         self.progress = progress
-        self.provider = WereadProvider(account.credentials, account.transport)
+        self.provider = WereadProvider(account.credentials, account.transport, cache_reads=progress is not None)
         self.books: list[Book] = []
         self.chapters: list[Chapter] = []
         self.selected_book: Book | None = None
@@ -103,14 +104,21 @@ class LibraryScreen(Screen[None]):
                 await catalogue.append(ListItem(Label(f"{indent}{chapter.title}", markup=False)))
             self.show_status(f"《{book.title}》共 {len(self.chapters)} 章；Tab 切换目录，Enter 阅读章节。")
             if self.progress is not None:
-                saved = self.progress.load(book.account_id, book.book_id)
-                if saved is not None:
-                    saved_chapter = next((chapter for chapter in self.chapters if chapter.uid == saved.chapter_uid), None)
+                plan = await select_resume(self.provider, self.progress, book)
+                if self.selected_book != book:
+                    return
+                if plan is not None:
+                    saved_chapter = next((chapter for chapter in self.chapters if chapter.uid == plan.position.chapter_uid), None)
                     if saved_chapter is None:
-                        self.show_status("保存的章节已不在目录中，无法恢复本地位置；旧记录已保留。")
-                    else:
-                        self.app.push_screen(ReaderScreen(self.provider, self.account, book, saved_chapter, self.chapters,
-                                                         progress=self.progress, resume=True))
+                        fallback = plan.local_fallback("云端章节已不在目录中。")
+                        if fallback is not None:
+                            plan = fallback
+                            saved_chapter = next((chapter for chapter in self.chapters if chapter.uid == plan.position.chapter_uid), None)
+                    if saved_chapter is None:
+                        self.show_status("保存的章节已不在目录中，无法恢复位置；旧记录已保留。")
+                        return
+                    self.app.push_screen(ReaderScreen(self.provider, self.account, book, saved_chapter, self.chapters,
+                                                     progress=self.progress, resume=True, resume_plan=plan))
         except ProviderError as error:
             self.show_error(error)
 
@@ -118,6 +126,8 @@ class LibraryScreen(Screen[None]):
         """显示 message，升级提示不阻断当前业务数据。"""
         if self.provider.upgrade_available:
             message += " 官方接口有版本更新提示，当前数据仍可使用。"
+        if self.provider.using_cache:
+            message += " 部分阅读数据来自本地缓存。"
         self.query_one("#library-status", Static).update(message)
 
     def show_error(self, error: ProviderError) -> None:

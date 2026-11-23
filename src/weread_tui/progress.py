@@ -13,7 +13,7 @@ from weread_tui.positions import ContentAnchor
 
 @dataclass(frozen=True)
 class ReadingProgress:
-    """account_id/book_id/chapter_uid 标识内容，anchor 定位字符，updated_at 是实际阅读时间。"""
+    """account_id/book_id/chapter_uid 标识内容，anchor 定位字符，updated_at 为实际阅读时间，0 表示未知。"""
 
     account_id: str
     book_id: str

@@ -16,6 +16,10 @@ class WebSessionExpired(ContentError):
     """服务端明确拒绝网页会话，需要重新扫码。"""
 
 
+class ChapterUnavailable(ContentError):
+    """网络无法访问正文或样式，可尝试本人已有的阅读缓存。"""
+
+
 def check_response(response: httpx.Response) -> None:
     """区分 response 的登录失效和访问拒绝，其他 HTTP 错误由上层显示。"""
     if response.status_code == 401:
@@ -108,6 +112,8 @@ async def fetch_chapter(client: httpx.AsyncClient, book_id: str, chapter_uid: st
         if format_name == "epub" and any(ord(character) < 32 and character not in "\t\n\r" for character in source):
             raise ContentError("正文包含非法 XML 字符，可能存在分片版本不一致。")
         return source, format_name
+    except httpx.RequestError:
+        raise ChapterUnavailable("正文网络不可用，请检查网络后重新加载。") from None
     except httpx.HTTPError:
         raise ContentError("正文请求失败，请检查网络后重新加载。") from None
     except (json.JSONDecodeError, UnicodeError):
@@ -127,5 +133,7 @@ async def fetch_stylesheet(client: httpx.AsyncClient, book_id: str, chapter_uid:
         if not isinstance(part, str):
             raise ContentError("当前章节未返回可用的原书样式。")
         return decode_content(part)
+    except httpx.RequestError:
+        raise ChapterUnavailable("原书样式网络不可用。") from None
     except (httpx.HTTPError, json.JSONDecodeError):
         raise ContentError("原书样式暂时无法读取。") from None

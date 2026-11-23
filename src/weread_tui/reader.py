@@ -19,6 +19,7 @@ from weread_tui.terminal import terminal_capabilities
 from weread_tui.progress import ProgressStore
 from weread_tui.source_positions import prepare_document
 from weread_tui.positions import PositionError
+from weread_tui.reading_resume import ResumePlan, ResumePoint, load_resume
 
 
 class ReaderScreen(Screen[None]):
@@ -44,8 +45,9 @@ class ReaderScreen(Screen[None]):
 
     def __init__(self, provider: WereadProvider, account: AccountService, book: Book,
                  chapter: Chapter, chapters: list[Chapter] | None = None,
-                 progress: ProgressStore | None = None, resume: bool = False) -> None:
-        """provider/account 提供账号，book/chapter/chapters 指定内容，progress/resume 控制本地恢复。"""
+                 progress: ProgressStore | None = None, resume: bool = False,
+                 resume_plan: ResumePlan | None = None) -> None:
+        """provider/account 提供账号，book/chapter/chapters 指定内容，progress/resume/resume_plan 控制续读。"""
         super().__init__()
         self.provider = provider
         self.account = account
@@ -58,6 +60,8 @@ class ReaderScreen(Screen[None]):
         self.progress = progress
         self.remember_chapter = not resume
         self.resume_graphics = resume
+        self.resume_plan = resume_plan
+        self.resume_point: ResumePoint | None = None
 
     def compose(self) -> ComposeResult:
         """生成章节正文区和操作提示。"""
@@ -83,7 +87,14 @@ class ReaderScreen(Screen[None]):
         await content.mount(Static("正在读取正文…", markup=False))
         self.document = None
         try:
-            document = await self.provider.get_chapter(self.book, self.chapter)
+            if self.resume_plan is not None:
+                document, self.resume_point, self.resume_plan = await load_resume(
+                    self.provider, self.book, self.chapters, self.resume_plan,
+                )
+                self.chapter = document.chapter
+                self.chapter_index = self.chapters.index(self.chapter)
+            else:
+                document = await self.provider.get_chapter(self.book, self.chapter)
             blocks = parse_content(document)
             await content.remove_children()
             for index, block in enumerate(blocks):
@@ -121,7 +132,7 @@ class ReaderScreen(Screen[None]):
             if self.resume_graphics:
                 self.resume_graphics = False
                 self.action_graphics()
-        except (ContentError, ProviderError) as error:
+        except (ContentError, ProviderError, PositionError) as error:
             if isinstance(error, WebSessionExpired):
                 self.account.web_status = "已失效"
             self.clear_images()
@@ -147,6 +158,9 @@ class ReaderScreen(Screen[None]):
         self.chapter_index = index
         self.chapter = self.chapters[index]
         self.remember_chapter = True
+        self.resume_plan = None
+        self.resume_point = None
+        self.resume_graphics = False
         self.query_one("#reading-status", Static).update(f"《{self.book.title}》 · {self.chapter.title}")
         self.action_reload()
 
@@ -167,7 +181,25 @@ class ReaderScreen(Screen[None]):
         if not capabilities.graphics:
             self.notify("当前终端未探测到书页图像协议，继续使用文字阅读。")
             return
-        self.app.push_screen(GraphicsScreen(self.provider, self.document, capabilities, progress=self.progress))
+        self.app.push_screen(GraphicsScreen(self.provider, self.document, capabilities, progress=self.progress,
+                                            resume=self.resume_point), self.graphics_closed)
+
+    def graphics_closed(self, reason: str | None) -> None:
+        """reason 表示云端字符无法在最终书页定位，此时尝试本地记录而非章首冒充成功。"""
+        if reason is None:
+            # 首次续读记录只使用一次，再打开时读取最新本地位置。
+            self.resume_plan = None
+            self.resume_point = None
+            return
+        fallback = self.resume_plan.local_fallback(reason) if self.resume_plan else None
+        if fallback is None:
+            self.resume_plan = None
+            self.resume_point = None
+            self.query_one("#reading-status", Static).update(reason + " 未自动恢复云端位置。")
+            return
+        self.resume_plan = fallback
+        self.resume_graphics = True
+        self.action_reload()
 
     def action_line_down(self) -> None:
         """正文向下滚动一行。"""

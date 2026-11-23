@@ -185,6 +185,8 @@ async def test_selecting_book_resumes_saved_chapter_and_chapter_change_is_commit
         if data["api_name"] == "/book/chapterinfo":
             return httpx.Response(200, json={"chapters": [
                 {"chapterUid": chapter.uid, "title": chapter.title} for chapter in chapters]})
+        if data["api_name"] == "/book/getprogress":
+            return httpx.Response(200, json={"bookId": "1", "book": {}})
         assert data["api_name"] == "/_list"
         return httpx.Response(200, json={})
 

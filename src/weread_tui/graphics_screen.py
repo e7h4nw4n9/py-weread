@@ -21,10 +21,11 @@ from weread_tui.resources import ImageResources
 from weread_tui.models import ChapterDocument
 from weread_tui.provider import ProviderError, WereadProvider
 from weread_tui.progress import ProgressStore
+from weread_tui.reading_resume import ResumePoint
 from weread_tui.terminal import TerminalCapabilities, refresh_terminal_capabilities
 
 
-class GraphicsScreen(Screen[None]):
+class GraphicsScreen(Screen[str | None]):
     """分页与栅格化在子进程执行，界面只读取已完成的页面图片。"""
 
     BINDINGS = [
@@ -43,8 +44,8 @@ class GraphicsScreen(Screen[None]):
     """
 
     def __init__(self, provider: WereadProvider, document: ChapterDocument, capabilities: TerminalCapabilities,
-                 progress: ProgressStore | None = None) -> None:
-        """provider/document 提供正文，capabilities 描述终端，progress 可保存本地位置。"""
+                 progress: ProgressStore | None = None, resume: ResumePoint | None = None) -> None:
+        """provider/document 提供正文，capabilities 描述终端，progress/resume 控制位置保存及续读来源。"""
         super().__init__()
         self.provider = provider
         self.document = document
@@ -62,16 +63,21 @@ class GraphicsScreen(Screen[None]):
         self.current_page = 0
         self.reading_anchor: ContentAnchor | None = None
         self.progress = progress
+        self.resume_position = resume
         self.saved_progress = progress.load(document.book.account_id, document.book.book_id, document.chapter.uid) if progress else None
-        self.position_notice = ""
-        if self.saved_progress is not None:
+        self.position_notice = resume.notice if resume else ""
+        if resume is not None and resume.source == "cloud":
+            self.reading_anchor = resume.anchor
+        elif self.saved_progress is not None:
+            anchor = resume.anchor if resume else self.saved_progress.anchor
             try:
-                self.prepared.source_offset(self.saved_progress.anchor)
+                self.prepared.source_offset(anchor)
             except PositionError as error:
-                self.position_notice = f"无法准确恢复本地位置：{error}旧记录已保留。"
+                self.position_notice += f"无法准确恢复本地位置：{error}旧记录已保留。"
             else:
-                self.reading_anchor = self.saved_progress.anchor
-                self.position_notice = "已恢复本地阅读位置。"
+                self.reading_anchor = anchor
+                if not self.position_notice:
+                    self.position_notice = "已恢复本地阅读位置。"
         self.render_version = 0
         self.rendering = False
         self.closing = False
@@ -151,6 +157,9 @@ class GraphicsScreen(Screen[None]):
             try:
                 index = pending.page_map.locate(anchor) if anchor is not None else 0
             except PositionError as error:
+                if self.resume_position is not None and self.resume_position.source == "cloud" and not self.session.page_count:
+                    self.dismiss(f"云端字符无法在书页准确定位：{error}")
+                    return
                 if self.session.page_count or self.saved_progress is None:
                     raise
                 self.position_notice = f"无法准确恢复本地位置：{error}旧记录已保留，从章首显示。"
@@ -167,8 +176,12 @@ class GraphicsScreen(Screen[None]):
             self.reading_anchor = anchor if anchor is not None else pending.page_map.first_anchor(index)
             self.rendered_settings = (font_size, line_height)
             self.update_status()
-            if first_display and self.saved_progress is None:
-                self.save_position()
+            if first_display:
+                if self.resume_position is not None and self.resume_position.source == "cloud":
+                    # 未知阅读时间用 0 标记，不用本次抓取或恢复时间冒充。
+                    self.save_position(updated_at=self.resume_position.updated_at or 0.0)
+                elif self.saved_progress is None and self.resume_position is None:
+                    self.save_position()
             await previous.close()
         except (ContentError, ProviderError, RenderError, PositionError) as error:
             if version != self.render_version or self.closing:
@@ -190,13 +203,14 @@ class GraphicsScreen(Screen[None]):
             f"{self.document.chapter.title} · 第 {self.current_page + 1}/{self.session.page_count} 页"
             f" · 字号 {font_size} · 行距 {line_height:.1f}"
             f" {self.position_notice}"
+            + (" 部分数据来自本地缓存。" if self.provider.using_cache else "")
         )
 
-    def save_position(self) -> None:
-        """仅在首次阅读或实际翻页时立即提交，不在恢复和重排时刷新时间。"""
+    def save_position(self, *, updated_at: float | None = None) -> None:
+        """提交实际翻页位置；updated_at 用于原样保留已验证云端记录的阅读时间。"""
         if self.progress is not None and self.reading_anchor is not None:
             try:
-                self.saved_progress = self.progress.save(self.document, self.reading_anchor)
+                self.saved_progress = self.progress.save(self.document, self.reading_anchor, updated_at=updated_at)
             except sqlite3.Error as error:
                 self.notify(f"本地阅读位置保存失败：{error}", severity="error")
 
@@ -291,7 +305,7 @@ class GraphicsScreen(Screen[None]):
 
     def action_back(self) -> None:
         """返回文字阅读界面。"""
-        self.app.pop_screen()
+        self.dismiss(None)
 
     async def on_unmount(self) -> None:
         """清理终端图像、原生子进程及当前会话的临时文件。"""

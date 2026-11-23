@@ -1,6 +1,6 @@
 """阅读领域的书架、章节与原始正文。"""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from hashlib import sha256
 
 
@@ -26,12 +26,13 @@ class Chapter:
 
 @dataclass(frozen=True)
 class ChapterDocument:
-    """保留 book、chapter 的原始 source 与 format，显示转换不修改原文。"""
+    """保留 book/chapter 的 source/format；from_cache 只标记来源，不改变内容身份。"""
 
     book: Book
     chapter: Chapter
     source: str
     format: str
+    from_cache: bool = field(default=False, compare=False)
 
     @property
     def revision(self) -> str:
